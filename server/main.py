@@ -14,6 +14,18 @@ QUARTER_MAP = {
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
 }
 
+# Supplier lead times per category. No lead-time field exists on inventory or
+# demand fixtures, so the restocking flow derives it from the item's category
+# at order-placement time. Defaults to 14 days when a category is unmapped.
+LEAD_TIME_BY_CATEGORY = {
+    'Circuit Boards':  14,
+    'Sensors':          7,
+    'Actuators':       10,
+    'Controllers':     12,
+    'Power Supplies':   9,
+}
+DEFAULT_LEAD_TIME_DAYS = 14
+
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
     if not month or month == 'all':
@@ -80,6 +92,8 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    # Populated only for restocks placed through /api/restock/orders.
+    lead_time_days: Optional[int] = None
 
 class DemandForecast(BaseModel):
     id: str
@@ -89,6 +103,9 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    # Added for the restocking flow. Optional so older fixtures still validate.
+    category: Optional[str] = None
+    unit_cost: Optional[float] = None
 
 class BacklogItem(BaseModel):
     id: str
@@ -303,6 +320,142 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+# ---------------------------------------------------------------------------
+# Restocking
+# ---------------------------------------------------------------------------
+
+class RestockOrderItem(BaseModel):
+    sku: str
+    quantity: int
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
+    warehouse: Optional[str] = None
+
+
+def _forecast_by_sku(sku: str):
+    return next((f for f in demand_forecasts if f.get("item_sku") == sku), None)
+
+
+def _compute_restock_candidates():
+    """The forecast fixture is the source of truth for restocking — its SKUs
+    intentionally don't overlap with inventory SKUs in this demo. A SKU is a
+    candidate when forecasted demand exceeds current demand; the gap is what
+    needs to be ordered to meet the projection."""
+    candidates = []
+    for forecast in demand_forecasts:
+        gap = forecast.get("forecasted_demand", 0) - forecast.get("current_demand", 0)
+        if gap <= 0:
+            continue
+        unit_cost = forecast.get("unit_cost", 0) or 0
+        candidates.append({
+            "sku": forecast["item_sku"],
+            "name": forecast["item_name"],
+            "category": forecast.get("category"),
+            "current_demand": forecast.get("current_demand", 0),
+            "forecasted_demand": forecast.get("forecasted_demand", 0),
+            "gap": gap,
+            "unit_cost": unit_cost,
+            "line_cost": round(gap * unit_cost, 2),
+            "trend": forecast.get("trend"),
+        })
+    return candidates
+
+
+@app.get("/api/restock/recommend")
+def recommend_restock(budget: float = 0):
+    """Greedy restock recommendation: rank under-stocked items by demand gap
+    (descending) and accept each one only if its full line cost still fits in
+    the remaining budget. Items that don't fit are skipped rather than partially
+    filled — partial fills don't actually cover the forecast for that SKU."""
+    if budget < 0:
+        raise HTTPException(status_code=400, detail="budget must be non-negative")
+
+    candidates = _compute_restock_candidates()
+    # Sort by raw quantity gap so the most under-stocked items are considered
+    # first; ties broken by line_cost descending so a tied pair prefers the
+    # higher-value (more business-critical) restock.
+    candidates.sort(key=lambda c: (c["gap"], c["line_cost"]), reverse=True)
+
+    selected = []
+    remaining = budget
+    for c in candidates:
+        if c["line_cost"] <= remaining:
+            selected.append({**c, "suggested_quantity": c["gap"]})
+            remaining -= c["line_cost"]
+
+    total_cost = round(sum(s["line_cost"] for s in selected), 2)
+    return {
+        "budget": budget,
+        "total_cost": total_cost,
+        "remaining_budget": round(remaining, 2),
+        "recommendations": selected,
+        "skipped_count": len(candidates) - len(selected),
+    }
+
+
+@app.post("/api/restock/orders", response_model=Order)
+def create_restock_order(req: CreateRestockOrderRequest):
+    """Place a restock order. Builds a new Order record with status='Submitted'
+    and pushes it into the in-memory orders list so it shows up in the existing
+    Orders endpoint. Lead time is the max across the categories represented in
+    the order — the order isn't complete until the slowest line arrives."""
+    if not req.items:
+        raise HTTPException(status_code=400, detail="items must not be empty")
+
+    from datetime import datetime, timedelta
+    order_items = []
+    total_value = 0.0
+    lead_times = []
+
+    for line in req.items:
+        forecast = _forecast_by_sku(line.sku)
+        if not forecast:
+            raise HTTPException(status_code=404, detail=f"Unknown SKU: {line.sku}")
+        if line.quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"quantity must be positive for {line.sku}")
+
+        unit_cost = forecast.get("unit_cost", 0) or 0
+        line_total = round(line.quantity * unit_cost, 2)
+        total_value += line_total
+        lead_times.append(LEAD_TIME_BY_CATEGORY.get(forecast.get("category"), DEFAULT_LEAD_TIME_DAYS))
+
+        # Keep the same item shape Orders.vue already renders: it reads
+        # item.name, item.quantity and item.unit_price. Restock uses unit_cost
+        # as the price the company pays the supplier.
+        order_items.append({
+            "sku": forecast["item_sku"],
+            "name": forecast["item_name"],
+            "quantity": line.quantity,
+            "unit_price": unit_cost,
+            "line_total": line_total,
+        })
+
+    lead_time_days = max(lead_times) if lead_times else DEFAULT_LEAD_TIME_DAYS
+    today = datetime.utcnow().date()
+    expected = today + timedelta(days=lead_time_days)
+    sequence = sum(1 for o in orders if o.get("status") == "Submitted") + 1
+
+    new_order = {
+        "id": f"RSO-{int(datetime.utcnow().timestamp())}",
+        "order_number": f"RSO-{today.strftime('%Y%m%d')}-{sequence:03d}",
+        "customer": "Internal Restock",
+        "items": order_items,
+        "status": "Submitted",
+        "order_date": today.isoformat(),
+        "expected_delivery": expected.isoformat(),
+        "total_value": round(total_value, 2),
+        "actual_delivery": None,
+        "warehouse": req.warehouse,
+        # Restock orders span multiple categories by design; leave blank so the
+        # standard category filter doesn't accidentally hide them.
+        "category": None,
+        "lead_time_days": lead_time_days,
+    }
+    orders.append(new_order)
+    return new_order
+
 
 if __name__ == "__main__":
     import uvicorn
